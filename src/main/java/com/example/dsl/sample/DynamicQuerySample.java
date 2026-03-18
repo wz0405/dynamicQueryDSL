@@ -1,7 +1,9 @@
 package com.example.dsl.sample;
 
 import com.example.dsl.mapper.DynamicQueryMapper;
+import com.example.dsl.spec.DynamicQueryBuilder;
 import com.example.dsl.spec.DynamicQuerySpec;
+import java.util.Map;
 import com.example.dsl.validator.DynamicQueryValidator;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -48,7 +50,7 @@ public class DynamicQuerySample {
                 .where("o", "MERCHANT_ID", merchantId)
                 .limit(100);
 
-        return mapper.selectDynamic(spec);
+        return mapper.selectDynamic(DynamicQueryBuilder.buildParamMap(spec));
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -84,7 +86,7 @@ public class DynamicQuerySample {
                 .orderBy("o", "ORDER_DT", true)
                 .limit(100);
 
-        return mapper.selectDynamic(spec);
+        return mapper.selectDynamic(DynamicQueryBuilder.buildParamMap(spec));
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -124,7 +126,7 @@ public class DynamicQuerySample {
                 .whereBetween("o", "ORDER_DT", frDt, toDt)
                 .limit(100);
 
-        return mapper.selectDynamic(spec);
+        return mapper.selectDynamic(DynamicQueryBuilder.buildParamMap(spec));
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -150,7 +152,7 @@ public class DynamicQuerySample {
                 .select("o", "STATUS")
                 .whereIn("o", "ORDER_ID", orderIdList);
 
-        return mapper.selectDynamic(spec);
+        return mapper.selectDynamic(DynamicQueryBuilder.buildParamMap(spec));
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -179,7 +181,7 @@ public class DynamicQuerySample {
         // EXPLAIN 실행 — 이슈 발견 시 WARN 로그 출력
         validator.validate(spec);
 
-        return mapper.selectDynamic(spec);
+        return mapper.selectDynamic(DynamicQueryBuilder.buildParamMap(spec));
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -214,6 +216,6 @@ public class DynamicQuerySample {
                 .orderBy("o", "ORDER_DT", true)
                 .limit(50);
 
-        return mapper.selectDynamic(spec);
+        return mapper.selectDynamic(DynamicQueryBuilder.buildParamMap(spec));
     }
 }

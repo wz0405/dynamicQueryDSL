@@ -15,10 +15,10 @@ import java.util.Map;
  *
  * <h3>동작 방식</h3>
  * <ol>
- *   <li>SQL 생성 (DynamicQueryBuilder)</li>
+ *   <li>SQL 생성 (DynamicQueryBuilder) — MyBatis #{} 바인딩 변수를 ? 로 치환</li>
  *   <li>EXPLAIN 실행</li>
  *   <li>결과 분석 — Full Scan / 인덱스 미사용 / filesort / temporary 감지</li>
- *   <li>옵션에 따라 WARNING 로그 또는 Exception throw</li>
+ *   <li>모드에 따라 WARNING 로그 또는 Exception throw</li>
  * </ol>
  *
  * <h3>사용 예시</h3>
@@ -27,12 +27,17 @@ import java.util.Map;
  * validator.setMode(DynamicQueryValidator.Mode.WARN); // 개발환경 권장
  *
  * DynamicQuerySpec spec = new DynamicQuerySpec()
- *     .mainTable("TBTR_C_MSTR", "mstr")
- *     .where("mstr", "CID", cid)
+ *     .mainTable("ORDERS", "o")
+ *     .where("o", "STORE_ID", storeId)
  *     .limit(100);
  *
  * validator.validate(spec); // EXPLAIN 분석 후 이슈 로그 출력
+ * List<Map<String, Object>> result = mapper.selectDynamic(spec);
  * }</pre>
+ *
+ * <h3>주의</h3>
+ * <p>MySQL / MariaDB 환경에서만 동작한다.
+ * H2 등 다른 DB는 EXPLAIN 결과 포맷이 달라 자동으로 스킵된다.</p>
  */
 @Slf4j
 public class DynamicQueryValidator {
@@ -71,15 +76,24 @@ public class DynamicQueryValidator {
     public void setMaxFullScanRows(int maxRows) {
         this.maxFullScanRows = maxRows;
     }
-    private boolean isMySql() {
+
+    /**
+     * MySQL / MariaDB 환경 여부를 확인한다.
+     *
+     * <p>H2 등 다른 DB는 EXPLAIN 결과 포맷이 달라 검증을 스킵한다.</p>
+     *
+     * @return MySQL 또는 MariaDB이면 true
+     */
+    private boolean isMySqlCompatible() {
         try {
             String url = jdbcTemplate.getDataSource()
                     .getConnection().getMetaData().getURL();
-            return url.startsWith("jdbc:mariadb");
+            return url.startsWith("jdbc:mysql") || url.startsWith("jdbc:mariadb");
         } catch (Exception e) {
             return false;
         }
     }
+
     /**
      * 주어진 {@link DynamicQuerySpec}에 대해 EXPLAIN을 실행하고 성능 이슈를 분석한다.
      *
@@ -88,29 +102,31 @@ public class DynamicQueryValidator {
      */
     public void validate(DynamicQuerySpec spec) {
         if (mode == Mode.OFF) return;
-        if (!isMySql()) {
-            log.info("[DynamicQuery] H2 환경 — EXPLAIN 검증 스킵 (MySQL에서만 동작)");
+        if (!isMySqlCompatible()) {
+            log.info("[DynamicQuery] H2 환경 — EXPLAIN 검증 스킵 (MySQL/MariaDB에서만 동작)");
             return;
         }
 
-        DynamicQueryBuilder builder = new DynamicQueryBuilder();
-        String sql = builder.build(spec).replaceAll("#\\{[^}]+\\}", "?");
+        // MyBatis #{...} 바인딩 변수를 JDBC ? 로 치환
+        Map<String, Object> paramMap = DynamicQueryBuilder.buildParamMap(spec);
+        String sql = ((String) paramMap.get("__sql__")).replaceAll("#\\{[^}]+\\}", "?");
+        Object[] params = collectParams(spec);
 
         log.info("[DynamicQuery] EXPLAIN 분석 시작");
-        log.debug("[DynamicQuery] SQL: {}", builder.buildPreview(spec));
+        log.debug("[DynamicQuery] SQL: {}", DynamicQueryBuilder.buildPreview(spec));
 
         try {
             List<Map<String, Object>> explainRows =
-                    jdbcTemplate.queryForList("EXPLAIN " + sql, collectParams(spec));
+                    jdbcTemplate.queryForList("EXPLAIN " + sql, params);
 
             List<String> issues = new ArrayList<>();
 
             for (Map<String, Object> row : explainRows) {
                 String table = String.valueOf(row.get("table"));
-                String type = String.valueOf(row.get("type"));
-                String key = String.valueOf(row.get("key"));
+                String type  = String.valueOf(row.get("type"));
+                String key   = String.valueOf(row.get("key"));
                 String extra = row.get("Extra") != null ? String.valueOf(row.get("Extra")) : "";
-                Long rows = row.get("rows") instanceof Number n ? n.longValue() : null;
+                Long rows    = row.get("rows") instanceof Number n ? n.longValue() : null;
 
                 // Full Table Scan
                 if ("ALL".equalsIgnoreCase(type)) {
@@ -142,7 +158,7 @@ public class DynamicQueryValidator {
                             "[주의] '%s' 테이블 임시 테이블 생성. GROUP BY / ORDER BY 최적화를 고려하세요.", table));
                 }
 
-                // 정상 케이스 로그
+                // 정상 케이스
                 if ("eq_ref".equalsIgnoreCase(type) || "ref".equalsIgnoreCase(type)) {
                     log.info("[DynamicQuery] [최적] '{}' 테이블 인덱스 사용 (type={})", table, type);
                 }
@@ -166,20 +182,64 @@ public class DynamicQueryValidator {
         }
     }
 
-    // EXPLAIN 실행 시 파라미터 수집 (값 치환용)
+    /**
+     * EXPLAIN 실행 시 ? 파라미터에 바인딩할 값 배열을 수집한다.
+     *
+     * <p>WHERE 조건 타입별로 파라미터를 순서대로 추출한다:</p>
+     * <ul>
+     *   <li>BETWEEN → from, to 순서로 2개 추가</li>
+     *   <li>IN / NOT IN → 목록의 모든 값 추가</li>
+     *   <li>IS NULL / IS NOT NULL → 파라미터 없음</li>
+     *   <li>whereRaw → rawParams 배열 순서대로 추가</li>
+     *   <li>그 외 일반 조건 → value 1개 추가</li>
+     * </ul>
+     *
+     * @param spec 쿼리 명세
+     * @return EXPLAIN에 바인딩될 파라미터 배열
+     */
     private Object[] collectParams(DynamicQuerySpec spec) {
         List<Object> params = new ArrayList<>();
+
         for (DynamicQuerySpec.WhereCondition wc : spec.whereConditions) {
-            if (wc.type == DynamicQuerySpec.ConditionType.BETWEEN) {
-                List<?> vals = (List<?>) wc.value;
-                params.add(vals.get(0));
-                params.add(vals.get(1));
-            } else if (wc.type == DynamicQuerySpec.ConditionType.IN) {
+
+            // whereRaw — {} 플레이스홀더에 바인딩된 값
+            if (wc.rawCondition != null) {
+                if (wc.rawParams != null) {
+                    for (Object p : wc.rawParams) {
+                        params.add(p);
+                    }
+                }
+                continue;
+            }
+
+            // IS NULL / IS NOT NULL — 파라미터 없음
+            if (wc.isNullCheck) {
+                continue;
+            }
+
+            if (wc.isBetween) {
+                // BETWEEN: value가 Object[] {from, to}
+                Object[] arr = (Object[]) wc.value;
+                params.add(arr[0]);
+                params.add(arr[1]);
+
+            } else if (wc.isIn) {
+                // IN / NOT IN: value가 List<?>
                 params.addAll((List<?>) wc.value);
-            } else {
+
+            } else if (wc.value != null) {
+                // 일반 조건: =, !=, >, >=, <, <=, LIKE
                 params.add(wc.value);
             }
         }
+
+        // HAVING 파라미터
+        for (DynamicQuerySpec.HavingCondition hc : spec.havingConditions) {
+            if (hc.rawCondition == null && hc.value != null) {
+                params.add(hc.value);
+            }
+        }
+
         return params.toArray();
     }
 
